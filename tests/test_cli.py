@@ -72,6 +72,86 @@ class CliTests(unittest.TestCase):
             any(f["check"] == "wp-config" and f["source"] == "wp-cli" for f in findings)
         )
 
+    def test_cve_check_uses_nvd_client_and_reports_cpe_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_wordpress_fixture(Path(tmp))
+            env_file = root / ".env"
+            env_file.write_text("NVD_API_KEY=test-nvd-key\n", encoding="utf-8")
+            cve_map = Path(tmp) / "cve-map.json"
+            cve_map.write_text(
+                json.dumps(
+                    {
+                        "plugins": {
+                            "example-plugin": (
+                                "cpe:2.3:a:example:example_plugin:{version}:*:*:*:*:wordpress:*:*"
+                            )
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calls: list[dict[str, str]] = []
+            api_keys: list[str] = []
+            original_fetch = cli.fetch_nvd_cves
+            original_api_key = os.environ.pop("NVD_API_KEY", None)
+            original_env_file = os.environ.get("IC_WP_HARDENING_ENV_FILE")
+            os.environ["IC_WP_HARDENING_ENV_FILE"] = str(env_file)
+
+            def fake_fetch(
+                params: dict[str, str],
+                nvd_api_key: str,
+                timeout: float,
+                cache: dict[str, object],
+                cache_path: Path | None,
+            ) -> tuple[dict[str, object], str, bool]:
+                calls.append(params)
+                api_keys.append(nvd_api_key)
+                if "example_plugin" in params.get("cpeName", ""):
+                    return make_nvd_response(), "", False
+                return {"vulnerabilities": []}, "", False
+
+            cli.fetch_nvd_cves = fake_fetch
+            try:
+                output = run_cli_capture(
+                    [
+                        str(root),
+                        "--format",
+                        "json",
+                        "--use-wp-cli",
+                        "never",
+                        "--php-ini",
+                        str(root / "php.ini"),
+                        "--cve-check",
+                        "--cve-map",
+                        str(cve_map),
+                        "--nvd-delay",
+                        "0",
+                        "--fail-on",
+                        "never",
+                    ]
+                )
+            finally:
+                cli.fetch_nvd_cves = original_fetch
+                if original_api_key is None:
+                    os.environ.pop("NVD_API_KEY", None)
+                else:
+                    os.environ["NVD_API_KEY"] = original_api_key
+                if original_env_file is None:
+                    os.environ.pop("IC_WP_HARDENING_ENV_FILE", None)
+                else:
+                    os.environ["IC_WP_HARDENING_ENV_FILE"] = original_env_file
+
+        report = json.loads(output)
+        findings = report["findings"]
+        cve_findings = [finding for finding in findings if finding["check"] == "cve"]
+        self.assertTrue(any("cpeName" in call for call in calls))
+        self.assertIn("test-nvd-key", api_keys)
+        self.assertEqual(cve_findings[0]["source"], "nvd:cpe")
+        self.assertIn("CVE-2024-0001", cve_findings[0]["message"])
+        evidence = json.loads(cve_findings[0]["evidence"])
+        self.assertEqual(evidence["id"], "CVE-2024-0001")
+        self.assertEqual(evidence["target"]["slug"], "example-plugin")
+
 
 def run_cli_capture(argv: list[str]) -> str:
     stdout = io.StringIO()
@@ -169,6 +249,39 @@ def make_fake_wp_cli(path: Path) -> Path:
     )
     os.chmod(path, 0o755)
     return path
+
+
+def make_nvd_response() -> dict[str, object]:
+    return {
+        "vulnerabilities": [
+            {
+                "cve": {
+                    "id": "CVE-2024-0001",
+                    "vulnStatus": "Analyzed",
+                    "published": "2024-01-01T00:00:00.000",
+                    "lastModified": "2024-01-02T00:00:00.000",
+                    "descriptions": [
+                        {
+                            "lang": "en",
+                            "value": "Example Plugin for WordPress has a test vulnerability.",
+                        }
+                    ],
+                    "metrics": {
+                        "cvssMetricV31": [
+                            {
+                                "cvssData": {
+                                    "baseSeverity": "HIGH",
+                                    "baseScore": 8.1,
+                                    "vectorString": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+                                }
+                            }
+                        ]
+                    },
+                    "references": [{"url": "https://example.test/CVE-2024-0001"}],
+                }
+            }
+        ]
+    }
 
 
 if __name__ == "__main__":

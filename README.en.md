@@ -51,6 +51,7 @@ When WP-CLI is available, the tool can inspect plugin and theme activation state
 - Installed plugin detection
 - wordpress.org plugin update checks when `--online` is specified
 - Plugin vulnerability matching with a local JSON database
+- CVE search through the NVD API when explicitly enabled
 - Theme detection, and activation/update state when WP-CLI is available
 - Must-use plugin (`wp-content/mu-plugins`) detection
 - Key `wp-config.php` hardening settings
@@ -80,6 +81,59 @@ ic-wp-hardening /path/to/wordpress --verify-checksums core
 ic-wp-hardening /path/to/wordpress --verify-checksums plugins
 ic-wp-hardening /path/to/wordpress --verify-checksums all
 ```
+
+## CVE Search
+
+When `--cve-check` is specified, the tool searches the NVD API for CVEs related to WordPress core, plugins, and themes.
+
+Do not put the NVD API key on the command line. Set it through an environment variable or `.env`.
+
+```dotenv
+NVD_API_KEY=your-api-key
+```
+
+`.env` can be placed in the current working directory or the target WordPress root. To use another file, set the `IC_WP_HARDENING_ENV_FILE` environment variable instead of passing a command-line argument.
+
+```bash
+ic-wp-hardening /path/to/wordpress --cve-check -o report.md
+```
+
+Search strategies:
+
+```bash
+ic-wp-hardening /path/to/wordpress --cve-check --cve-match both
+ic-wp-hardening /path/to/wordpress --cve-check --cve-match cpe
+ic-wp-hardening /path/to/wordpress --cve-check --cve-match keyword
+```
+
+`cpe` is a higher-confidence search based on CPE names. WordPress core uses a built-in CPE template. Plugins and themes do not always have stable CPE coverage, so you can provide mappings with `--cve-map`.
+
+```bash
+ic-wp-hardening /path/to/wordpress --cve-check --cve-map cve-map.json
+```
+
+Example `cve-map.json`:
+
+```json
+{
+  "plugins": {
+    "example-plugin": "cpe:2.3:a:example:example_plugin:{version}:*:*:*:*:wordpress:*:*"
+  },
+  "themes": {
+    "example-theme": "cpe:2.3:a:example:example_theme:{version}:*:*:*:*:wordpress:*:*"
+  }
+}
+```
+
+`keyword` searches use terms such as `WordPress <plugin name> <slug>`. Because keyword search can produce false positives or miss records, these results are reported as potential matches.
+
+To cache NVD API responses:
+
+```bash
+ic-wp-hardening /path/to/wordpress --cve-check --cve-cache .cache/nvd-cves.json
+```
+
+To respect NVD API rate limits, the default delay is 0.6 seconds with an API key and 6 seconds without an API key. Use `--nvd-delay` to override this.
 
 ## Report Formats
 
@@ -132,6 +186,8 @@ ic-wp-hardening /path/to/wordpress --fail-on never
 
 This tool is intended as an initial operational check. Plugin vulnerabilities are detected only when they are included in the supplied local database.
 For comprehensive vulnerability assessment, combine this tool with current vulnerability feeds or commercial/public APIs.
+
+When using the NVD API, this product uses data from the NVD API but is not endorsed or certified by the NVD. CVE keyword search is supplemental; review CVE references, CPE data, affected versions, and fixed versions before making a final assessment.
 
 ## License
 

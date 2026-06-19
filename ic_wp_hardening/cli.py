@@ -9,6 +9,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -49,9 +51,19 @@ class Theme:
     path: Path
 
 
+@dataclass(frozen=True)
+class CveTarget:
+    kind: str
+    slug: str
+    name: str
+    version: str
+    path: str = ""
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = args.wp_root.resolve()
+    load_env_files(root)
 
     findings: list[Finding] = []
     findings.extend(check_wordpress_root(root))
@@ -81,7 +93,25 @@ def main(argv: list[str] | None = None) -> int:
         findings.extend(check_plugins(plugins, args.online, args.timeout, args.vuln_db))
 
     findings.extend(check_themes(root, use_wp_cli, args.wp_cli_bin, args.online, args.timeout))
+    themes = discover_themes(root)
     findings.extend(check_mu_plugins(root))
+    if args.cve_check:
+        findings.extend(
+            check_cves(
+                root=root,
+                core_version=read_wordpress_version(root / "wp-includes" / "version.php"),
+                plugins=plugins,
+                themes=themes,
+                cve_map_path=args.cve_map,
+                cve_match=args.cve_match,
+                cve_max_results=args.cve_max_results,
+                cve_max_keyword_targets=args.cve_max_keyword_targets,
+                cve_cache_path=args.cve_cache,
+                nvd_api_key=os.environ.get("NVD_API_KEY", ""),
+                nvd_delay=args.nvd_delay,
+                timeout=args.timeout,
+            )
+        )
     findings.extend(
         check_wp_cli_checksums(
             root,
@@ -148,6 +178,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run WP-CLI checksum verification. Requires WP-CLI and network. Default: none.",
     )
     parser.add_argument(
+        "--cve-check",
+        action="store_true",
+        help="Search NVD for CVEs related to WordPress core, plugins, and themes.",
+    )
+    parser.add_argument(
+        "--cve-match",
+        choices=("cpe", "keyword", "both"),
+        default="both",
+        help="CVE search strategy. CPE matches are higher confidence. Default: both.",
+    )
+    parser.add_argument(
+        "--cve-map",
+        type=Path,
+        help="JSON file mapping WordPress core/plugins/themes to CPE names or templates.",
+    )
+    parser.add_argument(
+        "--cve-cache",
+        type=Path,
+        help="Optional JSON cache for NVD API responses.",
+    )
+    parser.add_argument(
+        "--cve-max-results",
+        type=int,
+        default=20,
+        help="Maximum NVD CVE records to request per target. Default: 20.",
+    )
+    parser.add_argument(
+        "--cve-max-keyword-targets",
+        type=int,
+        default=20,
+        help="Maximum plugin/theme targets searched with keyword fallback. Default: 20.",
+    )
+    parser.add_argument(
+        "--nvd-delay",
+        type=float,
+        help="Delay between NVD API requests. Default: 0.6s with API key, 6.0s without.",
+    )
+    parser.add_argument(
         "--max-permission-findings",
         type=int,
         default=25,
@@ -161,6 +229,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
+
+
+def load_env_files(root: Path) -> None:
+    candidates: list[Path] = []
+    configured = os.environ.get("IC_WP_HARDENING_ENV_FILE", "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend([Path.cwd() / ".env", root / ".env"])
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        load_env_file(resolved)
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists() or not path.is_file():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        if key in os.environ:
+            continue
+        os.environ[key] = parse_env_value(value)
+
+
+def parse_env_value(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    if (value.startswith('"') and value.endswith('"')) or (
+        value.startswith("'") and value.endswith("'")
+    ):
+        return value[1:-1]
+    return value.split(" #", 1)[0].strip()
 
 
 def resolve_wp_cli(mode: str, wp_cli_bin: str) -> tuple[bool, list[Finding]]:
@@ -1013,6 +1132,486 @@ def check_mu_plugins(root: Path) -> list[Finding]:
             )
         )
     return findings
+
+
+def check_cves(
+    root: Path,
+    core_version: str,
+    plugins: list[Plugin],
+    themes: list[Theme],
+    cve_map_path: Path | None,
+    cve_match: str,
+    cve_max_results: int,
+    cve_max_keyword_targets: int,
+    cve_cache_path: Path | None,
+    nvd_api_key: str,
+    nvd_delay: float | None,
+    timeout: float,
+) -> list[Finding]:
+    cve_map, map_findings = load_cve_map(cve_map_path)
+    findings: list[Finding] = [
+        Finding(
+            "cve-search",
+            "INFO",
+            "NVD CVE search is enabled.",
+            "This product uses data from the NVD API but is not endorsed or certified by the NVD.",
+            source="nvd",
+        ),
+        *map_findings,
+    ]
+    targets = build_cve_targets(root, core_version, plugins, themes)
+    if not targets:
+        findings.append(Finding("cve-search", "INFO", "No CVE search targets were detected.", source="nvd"))
+        return findings
+
+    cache = load_nvd_cache(cve_cache_path)
+    delay = nvd_delay if nvd_delay is not None else (0.6 if nvd_api_key else 6.0)
+    keyword_targets_used = 0
+    request_count = 0
+    match_count = 0
+
+    for target in targets:
+        target_cpes = cpe_values_for_target(target, cve_map)
+        if cve_match in {"cpe", "both"} and target_cpes:
+            for cpe_name in target_cpes:
+                request_count += 1
+                payload, error, from_cache = fetch_nvd_cves(
+                    {
+                        "cpeName": cpe_name,
+                        "isVulnerable": "",
+                        "noRejected": "",
+                        "resultsPerPage": str(cve_max_results),
+                    },
+                    nvd_api_key=nvd_api_key,
+                    timeout=timeout,
+                    cache=cache,
+                    cache_path=cve_cache_path,
+                )
+                findings.extend(
+                    nvd_payload_to_findings(
+                        payload,
+                        error,
+                        target,
+                        confidence="cpe",
+                        query=cpe_name,
+                        from_cache=from_cache,
+                    )
+                )
+                if payload:
+                    match_count += len(payload.get("vulnerabilities", []))
+                sleep_after_nvd_request(delay, from_cache)
+            continue
+
+        if cve_match in {"keyword", "both"} and target.kind != "core":
+            if keyword_targets_used >= cve_max_keyword_targets:
+                continue
+            keyword_targets_used += 1
+            keyword = cve_keyword_for_target(target)
+            request_count += 1
+            payload, error, from_cache = fetch_nvd_cves(
+                {"keywordSearch": keyword, "noRejected": "", "resultsPerPage": str(cve_max_results)},
+                nvd_api_key=nvd_api_key,
+                timeout=timeout,
+                cache=cache,
+                cache_path=cve_cache_path,
+            )
+            findings.extend(
+                nvd_payload_to_findings(
+                    payload,
+                    error,
+                    target,
+                    confidence="keyword",
+                    query=keyword,
+                    from_cache=from_cache,
+                )
+            )
+            if payload:
+                match_count += len(payload.get("vulnerabilities", []))
+            sleep_after_nvd_request(delay, from_cache)
+        elif cve_match == "cpe" and not target_cpes:
+            findings.append(
+                Finding(
+                    "cve-search",
+                    "INFO",
+                    f"No CPE mapping for {target.kind} {target.slug}.",
+                    "Provide --cve-map to enable high-confidence CPE matching.",
+                    path=target.path,
+                    source="nvd",
+                )
+            )
+
+    if cve_match in {"keyword", "both"} and keyword_targets_used >= cve_max_keyword_targets:
+        findings.append(
+            Finding(
+                "cve-search",
+                "INFO",
+                f"Keyword CVE search was limited to {cve_max_keyword_targets} plugin/theme target(s).",
+                "Increase --cve-max-keyword-targets to search more targets.",
+                source="nvd",
+            )
+        )
+    findings.append(
+        Finding(
+            "cve-search",
+            "INFO",
+            f"NVD CVE search completed with {request_count} request(s) and {match_count} raw match(es).",
+            source="nvd",
+        )
+    )
+    return findings
+
+
+def build_cve_targets(root: Path, core_version: str, plugins: list[Plugin], themes: list[Theme]) -> list[CveTarget]:
+    targets: list[CveTarget] = []
+    if core_version:
+        targets.append(
+            CveTarget(
+                kind="core",
+                slug="wordpress",
+                name="WordPress",
+                version=core_version,
+                path=str(root / "wp-includes" / "version.php"),
+            )
+        )
+    targets.extend(
+        CveTarget(
+            kind="plugin",
+            slug=plugin.slug,
+            name=plugin.name,
+            version=plugin.version,
+            path=str(plugin.path),
+        )
+        for plugin in plugins
+    )
+    targets.extend(
+        CveTarget(
+            kind="theme",
+            slug=theme.slug,
+            name=theme.name,
+            version=theme.version,
+            path=str(theme.path),
+        )
+        for theme in themes
+    )
+    return targets
+
+
+def load_cve_map(path: Path | None) -> tuple[dict[str, Any], list[Finding]]:
+    if path is None:
+        return {}, [
+            Finding(
+                "cve-map",
+                "INFO",
+                "No CVE CPE map was supplied.",
+                "WordPress core uses a built-in CPE template; plugins/themes use keyword fallback unless mapped.",
+                source="nvd",
+            )
+        ]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, [
+            Finding(
+                "cve-map",
+                "WARN",
+                "Could not read CVE CPE map.",
+                str(exc),
+                path=str(path),
+                source="nvd",
+            )
+        ]
+    if not isinstance(payload, dict):
+        return {}, [
+            Finding(
+                "cve-map",
+                "WARN",
+                "CVE CPE map must be a JSON object.",
+                path=str(path),
+                source="nvd",
+            )
+        ]
+    return payload, [Finding("cve-map", "PASS", "CVE CPE map was loaded.", path=str(path), source="nvd")]
+
+
+def cpe_values_for_target(target: CveTarget, cve_map: dict[str, Any]) -> list[str]:
+    if target.kind == "core":
+        configured = cve_map.get("core")
+        if configured:
+            return normalize_cpe_map_value(configured, target)
+        return [
+            format_cpe_template(
+                "cpe:2.3:a:wordpress:wordpress:{version}:*:*:*:*:*:*:*",
+                target,
+            )
+        ]
+
+    collection = cve_map.get(f"{target.kind}s", {})
+    if isinstance(collection, dict):
+        value = collection.get(target.slug) or collection.get(target.name)
+        if value:
+            return normalize_cpe_map_value(value, target)
+    return []
+
+
+def normalize_cpe_map_value(value: Any, target: CveTarget) -> list[str]:
+    values: list[str]
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = [item for item in value if isinstance(item, str)]
+    elif isinstance(value, dict):
+        raw = value.get("cpe") or value.get("cpes") or value.get("template")
+        values = normalize_cpe_map_value(raw, target) if raw else []
+    else:
+        values = []
+    return [format_cpe_template(item, target) for item in values if item.strip()]
+
+
+def format_cpe_template(template: str, target: CveTarget) -> str:
+    return template.format(
+        version=quote_cpe_component(target.version),
+        slug=quote_cpe_component(target.slug),
+        name=quote_cpe_component(slugify(target.name)),
+    )
+
+
+def quote_cpe_component(value: str) -> str:
+    return (value or "*").strip().replace(" ", "_").lower()
+
+
+def slugify(value: str) -> str:
+    lowered = value.strip().lower()
+    lowered = re.sub(r"[^a-z0-9._-]+", "_", lowered)
+    return lowered.strip("_") or "*"
+
+
+def cve_keyword_for_target(target: CveTarget) -> str:
+    pieces = ["WordPress"]
+    if target.name and target.name.lower() != target.slug.lower():
+        pieces.append(target.name)
+    pieces.append(target.slug)
+    return " ".join(dict.fromkeys(piece.strip() for piece in pieces if piece.strip()))
+
+
+def fetch_nvd_cves(
+    params: dict[str, str],
+    nvd_api_key: str,
+    timeout: float,
+    cache: dict[str, Any],
+    cache_path: Path | None,
+) -> tuple[dict[str, Any] | None, str, bool]:
+    url = build_nvd_url(params)
+    cache_key = url
+    cached = cache.get("responses", {}).get(cache_key)
+    if isinstance(cached, dict):
+        return cached, "", True
+
+    headers = {"User-Agent": f"ic-wp-hardening/{__version__}"}
+    if nvd_api_key:
+        headers["apiKey"] = nvd_api_key
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        message = exc.headers.get("message") or exc.reason
+        return None, f"NVD API HTTP {exc.code}: {message}", False
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        return None, f"NVD API request failed: {exc}", False
+
+    if not isinstance(payload, dict):
+        return None, "NVD API returned an unexpected payload.", False
+    if cache_path:
+        cache.setdefault("responses", {})[cache_key] = payload
+        write_nvd_cache(cache_path, cache)
+    return payload, "", False
+
+
+def build_nvd_url(params: dict[str, str]) -> str:
+    base = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    flags = [key for key, value in params.items() if value == ""]
+    values = {key: value for key, value in params.items() if value != ""}
+    query = urllib.parse.urlencode(values)
+    if flags:
+        query = "&".join(part for part in [query, *flags] if part)
+    return f"{base}?{query}" if query else base
+
+
+def load_nvd_cache(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.exists():
+        return {"responses": {}}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"responses": {}}
+    if isinstance(payload, dict) and isinstance(payload.get("responses"), dict):
+        return payload
+    return {"responses": {}}
+
+
+def write_nvd_cache(path: Path, cache: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def sleep_after_nvd_request(delay: float, from_cache: bool) -> None:
+    if not from_cache and delay > 0:
+        time.sleep(delay)
+
+
+def nvd_payload_to_findings(
+    payload: dict[str, Any] | None,
+    error: str,
+    target: CveTarget,
+    confidence: str,
+    query: str,
+    from_cache: bool,
+) -> list[Finding]:
+    if error:
+        return [
+            Finding(
+                "cve-search",
+                "WARN",
+                f"Could not search NVD CVEs for {target.kind} {target.slug}.",
+                error,
+                path=target.path,
+                source="nvd",
+            )
+        ]
+    if payload is None:
+        return []
+
+    vulnerabilities = payload.get("vulnerabilities", [])
+    if not isinstance(vulnerabilities, list) or not vulnerabilities:
+        return [
+            Finding(
+                "cve-search",
+                "PASS" if confidence == "cpe" else "INFO",
+                f"No NVD CVE matches found for {target.kind} {target.slug}.",
+                f"confidence: {confidence}; query: {query}; cached: {from_cache}",
+                path=target.path,
+                source=f"nvd:{confidence}",
+            )
+        ]
+
+    findings: list[Finding] = []
+    for item in vulnerabilities:
+        if not isinstance(item, dict):
+            continue
+        cve = item.get("cve")
+        if not isinstance(cve, dict):
+            continue
+        summary = summarize_nvd_cve(cve)
+        status = cve_finding_status(summary, confidence)
+        confidence_label = "confirmed CPE match" if confidence == "cpe" else "potential keyword match"
+        findings.append(
+            Finding(
+                "cve",
+                status,
+                f"{summary['id']} may affect {target.kind} {target.slug}.",
+                (
+                    f"severity: {summary['severity']}; score: {summary['score']}; "
+                    f"confidence: {confidence_label}; published: {summary['published']}; "
+                    f"kev: {summary['kev']}; cached: {from_cache}"
+                ),
+                path=target.path,
+                remediation="Review the CVE references and update or mitigate if applicable.",
+                evidence=json.dumps(
+                    {
+                        "target": asdict(target),
+                        "query": query,
+                        "confidence": confidence,
+                        **summary,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                source=f"nvd:{confidence}",
+            )
+        )
+    return findings
+
+
+def summarize_nvd_cve(cve: dict[str, Any]) -> dict[str, Any]:
+    metrics = extract_nvd_cvss(cve.get("metrics", {}))
+    references = extract_nvd_references(cve)
+    return {
+        "id": str(cve.get("id") or "CVE-UNKNOWN"),
+        "status": str(cve.get("vulnStatus") or ""),
+        "published": str(cve.get("published") or ""),
+        "last_modified": str(cve.get("lastModified") or ""),
+        "severity": metrics["severity"],
+        "score": metrics["score"],
+        "vector": metrics["vector"],
+        "kev": bool(cve.get("cisaExploitAdd")),
+        "description": first_english_description(cve.get("descriptions", [])),
+        "references": references[:5],
+    }
+
+
+def extract_nvd_cvss(metrics: Any) -> dict[str, Any]:
+    if not isinstance(metrics, dict):
+        return {"severity": "UNKNOWN", "score": "", "vector": ""}
+    for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        values = metrics.get(key)
+        if not isinstance(values, list) or not values:
+            continue
+        metric = values[0]
+        if not isinstance(metric, dict):
+            continue
+        cvss_data = metric.get("cvssData", {})
+        if not isinstance(cvss_data, dict):
+            continue
+        severity = metric.get("cvssV2Severity") or cvss_data.get("baseSeverity") or "UNKNOWN"
+        return {
+            "severity": str(severity).upper(),
+            "score": cvss_data.get("baseScore", ""),
+            "vector": str(cvss_data.get("vectorString") or ""),
+        }
+    return {"severity": "UNKNOWN", "score": "", "vector": ""}
+
+
+def extract_nvd_references(cve: dict[str, Any]) -> list[str]:
+    references = cve.get("references", [])
+    if isinstance(references, dict):
+        references = references.get("referenceData", [])
+    if not isinstance(references, list):
+        return []
+    urls: list[str] = []
+    for ref in references:
+        if isinstance(ref, dict):
+            url = str(ref.get("url") or "").strip()
+            if url:
+                urls.append(url)
+    return urls
+
+
+def first_english_description(descriptions: Any) -> str:
+    if not isinstance(descriptions, list):
+        return ""
+    fallback = ""
+    for description in descriptions:
+        if not isinstance(description, dict):
+            continue
+        value = str(description.get("value") or "").strip()
+        if not fallback:
+            fallback = value
+        if description.get("lang") == "en":
+            return value
+    return fallback
+
+
+def cve_finding_status(summary: dict[str, Any], confidence: str) -> str:
+    severity = str(summary.get("severity", "")).upper()
+    if summary.get("kev"):
+        return "FAIL"
+    if confidence == "keyword":
+        return "WARN" if severity in {"CRITICAL", "HIGH"} else "INFO"
+    if severity in {"CRITICAL", "HIGH"}:
+        return "FAIL"
+    if severity in {"MEDIUM", "LOW"}:
+        return "WARN"
+    return "INFO"
 
 
 def check_wp_cli_checksums(

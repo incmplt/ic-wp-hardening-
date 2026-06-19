@@ -23,6 +23,8 @@ from . import __version__
 STATUSES = ("PASS", "INFO", "WARN", "FAIL")
 
 
+# Report rows are carried as immutable dataclasses so every check can return
+# the same structured shape before the final Markdown/JSON rendering step.
 @dataclass(frozen=True)
 class Finding:
     check: str
@@ -65,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
     root = args.wp_root.resolve()
     load_env_files(root)
 
+    # Collect findings in the same order they should appear in the report:
+    # target validation first, then WordPress, extension, CVE, filesystem, and PHP checks.
     findings: list[Finding] = []
     findings.extend(check_wordpress_root(root))
     use_wp_cli, wp_cli_findings = resolve_wp_cli(args.use_wp_cli, args.wp_cli_bin)
@@ -78,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     findings.extend(check_core_version(root, args.online, args.timeout))
     findings.extend(check_wp_config(root, use_wp_cli, args.wp_cli_bin, args.timeout))
 
+    # Prefer WP-CLI for plugin state because it can report activation, updates,
+    # and repository metadata. Fall back to static header parsing when unavailable.
     plugins: list[Plugin] | None = None
     if use_wp_cli:
         plugins, plugin_findings = check_plugins_with_wp_cli(
@@ -130,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # Define the CLI surface in one place so main() can focus on orchestration.
     parser = argparse.ArgumentParser(
         prog="ic-wp-hardening",
         description="Check a local WordPress installation and output a security report.",
@@ -232,6 +239,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def load_env_files(root: Path) -> None:
+    # Later candidates are still considered, but existing environment variables
+    # are not overwritten by load_env_file().
     candidates: list[Path] = []
     configured = os.environ.get("IC_WP_HARDENING_ENV_FILE", "").strip()
     if configured:
@@ -248,6 +257,8 @@ def load_env_files(root: Path) -> None:
 
 
 def load_env_file(path: Path) -> None:
+    # Minimal dotenv parser: supports KEY=value and export KEY=value, while
+    # ignoring comments, malformed keys, and variables already set by the caller.
     if not path.exists() or not path.is_file():
         return
     try:
@@ -283,6 +294,8 @@ def parse_env_value(value: str) -> str:
 
 
 def resolve_wp_cli(mode: str, wp_cli_bin: str) -> tuple[bool, list[Finding]]:
+    # Resolve the user's WP-CLI preference into a boolean used by checks plus a
+    # finding that explains whether richer WP-CLI-backed checks will run.
     if mode == "never":
         return False, [Finding("wp-cli", "INFO", "WP-CLI integration is disabled.", source="wp-cli")]
 
@@ -306,6 +319,8 @@ def is_command_available(command: str) -> bool:
 
 
 def run_wp_cli_json(root: Path, wp_cli_bin: str, args: list[str], timeout: float) -> tuple[Any | None, str]:
+    # WP-CLI JSON calls share the same subprocess/error handling and return an
+    # error string instead of raising so the CLI can continue collecting findings.
     command = [wp_cli_bin, f"--path={root}", *args]
     completed = subprocess.run(
         command,
@@ -369,6 +384,8 @@ def check_wordpress_root(root: Path) -> list[Finding]:
 
 
 def check_core_version(root: Path, online: bool, timeout: float) -> list[Finding]:
+    # Static version detection always runs; the online latest-version comparison
+    # is opt-in to avoid unexpected network calls.
     version_file = root / "wp-includes" / "version.php"
     version = read_wordpress_version(version_file)
     if not version:
@@ -438,6 +455,8 @@ def read_wordpress_version(version_file: Path) -> str:
 
 
 def fetch_latest_wordpress_version(timeout: float) -> str:
+    # wordpress.org may return multiple offers; choose the highest advertised
+    # current version among upgrade/latest responses.
     with urllib.request.urlopen("https://api.wordpress.org/core/version-check/1.7/", timeout=timeout) as response:
         payload = json.loads(response.read().decode("utf-8"))
     offers = payload.get("offers") or []
@@ -449,6 +468,8 @@ def fetch_latest_wordpress_version(timeout: float) -> str:
 
 
 def check_wp_config(root: Path, use_wp_cli: bool, wp_cli_bin: str, timeout: float) -> list[Finding]:
+    # Combine static wp-config.php parsing with optional WP-CLI confirmation.
+    # Static parsing provides the actual hardening checks even without WordPress bootstrapping.
     config_path = find_wp_config(root)
     if config_path is None:
         return [
@@ -496,6 +517,8 @@ def find_wp_config(root: Path) -> Path | None:
 
 
 def parse_wp_config_file(path: Path) -> dict[str, str]:
+    # Extract simple define('KEY', value) constants and $table_prefix without
+    # executing PHP code from the target site.
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
@@ -527,6 +550,8 @@ def normalize_php_literal(value: str) -> str:
 
 
 def evaluate_wp_config_values(values: dict[str, str], config_path: Path) -> list[Finding]:
+    # Evaluate common production hardening signals in wp-config.php and keep each
+    # condition as a separate finding for clearer remediation.
     findings: list[Finding] = [
         Finding("wp-config", "PASS", "wp-config.php was found.", path=str(config_path))
     ]
@@ -638,6 +663,8 @@ def evaluate_wp_config_values(values: dict[str, str], config_path: Path) -> list
 
 
 def discover_plugins(root: Path) -> list[Plugin]:
+    # WordPress plugins can be a single PHP file or a directory containing a
+    # plugin header; scan both forms and stop at the first header per directory.
     plugins_dir = root / "wp-content" / "plugins"
     if not plugins_dir.exists():
         return []
@@ -658,6 +685,7 @@ def discover_plugins(root: Path) -> list[Plugin]:
 
 
 def parse_plugin_file(path: Path, slug: str) -> Plugin | None:
+    # Only the plugin header block is needed, so cap the read size to keep scans cheap.
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")[:8192]
     except OSError:
@@ -682,6 +710,8 @@ def check_plugins(
     timeout: float,
     vuln_db_path: Path | None,
 ) -> list[Finding]:
+    # Static plugin checks report inventory, optional local vulnerability matches,
+    # and optional wordpress.org update status.
     findings: list[Finding] = []
     if not plugins:
         findings.append(Finding("plugins", "INFO", "No plugins were detected."))
@@ -746,6 +776,8 @@ def check_plugins_with_wp_cli(
     timeout: float,
     vuln_db_path: Path | None,
 ) -> tuple[list[Plugin] | None, list[Finding]]:
+    # WP-CLI supplies runtime state that static file parsing cannot know, such as
+    # active/inactive status, auto-update settings, and repository update data.
     fields = "name,status,update,version,update_version,auto_update,file,title,wporg_status,wporg_last_updated"
     command = ["plugin", "list", f"--fields={fields}", "--format=json"]
     if not online:
@@ -854,6 +886,8 @@ def check_plugins_with_wp_cli(
 
 
 def load_vulnerability_db(path: Path | None) -> list[dict[str, Any]]:
+    # Accept both a flat vulnerability list and a {plugins: {slug: [...]}} shape
+    # so teams can maintain a small local advisory file without a strict schema.
     if path is None:
         return []
     try:
@@ -888,6 +922,8 @@ def load_vulnerability_db(path: Path | None) -> list[dict[str, Any]]:
 
 
 def check_plugin_vulnerabilities(plugin: Plugin, entries: list[dict[str, Any]]) -> list[Finding]:
+    # Match local advisory entries by plugin slug and version constraint.
+    # Unknown plugin versions are treated as potentially affected.
     findings: list[Finding] = []
     for entry in entries:
         slug = str(entry.get("slug", "")).strip()
@@ -927,6 +963,8 @@ def check_plugin_vulnerabilities(plugin: Plugin, entries: list[dict[str, Any]]) 
 
 
 def fetch_latest_plugin_version(slug: str, timeout: float) -> str:
+    # Query the public plugin information endpoint with sections/icons omitted to
+    # keep the response small.
     data = urllib.parse.urlencode(
         {
             "action": "plugin_information",
@@ -950,6 +988,8 @@ def fetch_latest_plugin_version(slug: str, timeout: float) -> str:
 
 
 def check_themes(root: Path, use_wp_cli: bool, wp_cli_bin: str, online: bool, timeout: float) -> list[Finding]:
+    # Prefer WP-CLI for theme activation/update state, but static style.css
+    # header parsing still gives useful inventory when WP-CLI cannot run.
     if use_wp_cli:
         wp_cli_findings = check_themes_with_wp_cli(root, wp_cli_bin, online, timeout)
         if wp_cli_findings is not None:
@@ -963,6 +1003,8 @@ def check_themes_with_wp_cli(
     online: bool,
     timeout: float,
 ) -> list[Finding] | None:
+    # WP-CLI can identify inactive themes and update availability, which are not
+    # reliable from filesystem inspection alone.
     fields = "name,status,update,version,update_version,auto_update,title"
     command = ["theme", "list", f"--fields={fields}", "--format=json"]
     if not online:
@@ -1041,6 +1083,7 @@ def check_themes_with_wp_cli(
 
 
 def check_themes_statically(root: Path) -> list[Finding]:
+    # Static theme checks intentionally avoid guessing activation state.
     themes = discover_themes(root)
     if not themes:
         return [Finding("themes", "INFO", "No themes were detected.")]
@@ -1068,6 +1111,7 @@ def check_themes_statically(root: Path) -> list[Finding]:
 
 
 def discover_themes(root: Path) -> list[Theme]:
+    # Theme metadata lives in each theme directory's style.css header.
     themes_dir = root / "wp-content" / "themes"
     if not themes_dir.exists():
         return []
@@ -1089,6 +1133,8 @@ def discover_themes(root: Path) -> list[Theme]:
 
 
 def check_mu_plugins(root: Path) -> list[Finding]:
+    # Must-use plugins are loaded automatically by WordPress from top-level PHP
+    # files, so they are always inventory-relevant even without activation state.
     mu_plugins_dir = root / "wp-content" / "mu-plugins"
     if not mu_plugins_dir.exists():
         return [Finding("mu-plugins", "INFO", "No must-use plugin directory was detected.")]
@@ -1148,6 +1194,8 @@ def check_cves(
     nvd_delay: float | None,
     timeout: float,
 ) -> list[Finding]:
+    # Build NVD search targets from detected core/plugins/themes, then prefer
+    # high-confidence CPE lookups and use keyword search only as a fallback.
     cve_map, map_findings = load_cve_map(cve_map_path)
     findings: list[Finding] = [
         Finding(
@@ -1173,6 +1221,8 @@ def check_cves(
     for target in targets:
         target_cpes = cpe_values_for_target(target, cve_map)
         if cve_match in {"cpe", "both"} and target_cpes:
+            # CPE searches are considered higher confidence because NVD performs
+            # product matching against structured platform identifiers.
             for cpe_name in target_cpes:
                 request_count += 1
                 payload, error, from_cache = fetch_nvd_cves(
@@ -1203,6 +1253,8 @@ def check_cves(
             continue
 
         if cve_match in {"keyword", "both"} and target.kind != "core":
+            # Keyword searches can be noisy, so they are capped and reported as
+            # lower-confidence findings.
             if keyword_targets_used >= cve_max_keyword_targets:
                 continue
             keyword_targets_used += 1
@@ -1262,6 +1314,7 @@ def check_cves(
 
 
 def build_cve_targets(root: Path, core_version: str, plugins: list[Plugin], themes: list[Theme]) -> list[CveTarget]:
+    # Normalize core, plugins, and themes into one target type for the NVD lookup pipeline.
     targets: list[CveTarget] = []
     if core_version:
         targets.append(
@@ -1334,6 +1387,8 @@ def load_cve_map(path: Path | None) -> tuple[dict[str, Any], list[Finding]]:
 
 
 def cpe_values_for_target(target: CveTarget, cve_map: dict[str, Any]) -> list[str]:
+    # WordPress core has a built-in CPE template; plugins/themes require an
+    # explicit map because their vendor/product names are not consistently derivable.
     if target.kind == "core":
         configured = cve_map.get("core")
         if configured:
@@ -1400,6 +1455,7 @@ def fetch_nvd_cves(
     cache: dict[str, Any],
     cache_path: Path | None,
 ) -> tuple[dict[str, Any] | None, str, bool]:
+    # Cache by fully built URL so identical parameter sets reuse the same NVD response.
     url = build_nvd_url(params)
     cache_key = url
     cached = cache.get("responses", {}).get(cache_key)
@@ -1428,6 +1484,8 @@ def fetch_nvd_cves(
 
 
 def build_nvd_url(params: dict[str, str]) -> str:
+    # NVD accepts some flags as key-only query parameters; empty strings represent
+    # those flags while normal values are URL encoded.
     base = "https://services.nvd.nist.gov/rest/json/cves/2.0"
     flags = [key for key, value in params.items() if value == ""]
     values = {key: value for key, value in params.items() if value != ""}
@@ -1467,6 +1525,8 @@ def nvd_payload_to_findings(
     query: str,
     from_cache: bool,
 ) -> list[Finding]:
+    # Convert raw NVD records into normal findings while keeping the raw summary
+    # in evidence for machine-readable follow-up.
     if error:
         return [
             Finding(
@@ -1533,6 +1593,7 @@ def nvd_payload_to_findings(
 
 
 def summarize_nvd_cve(cve: dict[str, Any]) -> dict[str, Any]:
+    # Keep only the report-relevant NVD fields and cap references to avoid huge reports.
     metrics = extract_nvd_cvss(cve.get("metrics", {}))
     references = extract_nvd_references(cve)
     return {
@@ -1550,6 +1611,7 @@ def summarize_nvd_cve(cve: dict[str, Any]) -> dict[str, Any]:
 
 
 def extract_nvd_cvss(metrics: Any) -> dict[str, Any]:
+    # Prefer newer CVSS versions first, falling back to older metrics when needed.
     if not isinstance(metrics, dict):
         return {"severity": "UNKNOWN", "score": "", "vector": ""}
     for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
@@ -1602,6 +1664,8 @@ def first_english_description(descriptions: Any) -> str:
 
 
 def cve_finding_status(summary: dict[str, Any], confidence: str) -> str:
+    # Confirmed CPE matches are escalated by severity; keyword matches stay softer
+    # because name-based matching can include unrelated products.
     severity = str(summary.get("severity", "")).upper()
     if summary.get("kev"):
         return "FAIL"
@@ -1621,6 +1685,8 @@ def check_wp_cli_checksums(
     verify_checksums: str,
     timeout: float,
 ) -> list[Finding]:
+    # Checksum verification is deliberately separate from normal inventory checks
+    # because it requires WP-CLI and can perform network-backed package lookups.
     if verify_checksums == "none":
         return []
     if not use_wp_cli:
@@ -1663,6 +1729,8 @@ def check_wp_cli_checksums(
 
 
 def check_permissions(root: Path, max_findings: int) -> list[Finding]:
+    # Walk the WordPress tree and report risky permission bits, limiting detailed
+    # rows so a badly configured site does not produce an unreadable report.
     findings: list[Finding] = []
     checked_files = 0
     checked_dirs = 0
@@ -1713,6 +1781,8 @@ def check_permissions(root: Path, max_findings: int) -> list[Finding]:
 
 
 def evaluate_permission(path: Path, is_dir: bool, root: Path) -> Finding | None:
+    # Treat world-writable paths as failures, and flag common WordPress hardening
+    # expectations for wp-config.php, directories, and regular files.
     try:
         mode = stat.S_IMODE(path.stat().st_mode)
     except OSError as exc:
@@ -1758,6 +1828,8 @@ def evaluate_permission(path: Path, is_dir: bool, root: Path) -> Finding | None:
 
 
 def check_php_settings(php_ini: Path | None, php_bin: str) -> list[Finding]:
+    # Read PHP settings from an explicit php.ini when provided; otherwise inspect
+    # the active PHP binary and evaluate a small set of production hardening keys.
     try:
         settings = read_php_settings(php_ini, php_bin)
     except Exception as exc:  # noqa: BLE001 - this is a CLI report surface.
@@ -1819,6 +1891,8 @@ def check_php_settings(php_ini: Path | None, php_bin: str) -> list[Finding]:
 
 
 def read_php_settings(php_ini: Path | None, php_bin: str) -> dict[str, str]:
+    # Prefer a provided php.ini for deterministic scans; php -i is a fallback for
+    # the runtime configuration on the current host.
     if php_ini:
         return parse_php_ini(php_ini.read_text(encoding="utf-8", errors="ignore"))
 
@@ -1833,6 +1907,7 @@ def read_php_settings(php_ini: Path | None, php_bin: str) -> dict[str, str]:
 
 
 def parse_php_ini(text: str) -> dict[str, str]:
+    # Parse simple php.ini key/value lines and ignore sections/comments.
     settings: dict[str, str] = {}
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -1846,6 +1921,7 @@ def parse_php_ini(text: str) -> dict[str, str]:
 
 
 def parse_php_info(text: str) -> dict[str, str]:
+    # php -i emits "key => local => master" style rows; the first value is the local setting.
     settings: dict[str, str] = {}
     for raw_line in text.splitlines():
         if "=>" not in raw_line:
@@ -1863,6 +1939,7 @@ def render_report(root: Path, findings: list[Finding], report_format: str) -> st
 
 
 def build_report_data(root: Path, findings: list[Finding]) -> dict[str, Any]:
+    # Shared report payload used by both Markdown and JSON renderers.
     now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     counts = {status: sum(1 for finding in findings if finding.status == status) for status in STATUSES}
     return {
@@ -1879,6 +1956,8 @@ def render_json_report(root: Path, findings: list[Finding]) -> str:
 
 
 def render_markdown_report(root: Path, findings: list[Finding]) -> str:
+    # Render findings as a Markdown table so reports are readable in terminals,
+    # pull requests, and issue trackers.
     report = build_report_data(root, findings)
     counts = report["summary"]
     lines = [
@@ -1933,6 +2012,7 @@ def write_report(output: Path | None, report: str) -> None:
 
 
 def exit_code(fail_on: str, findings: Iterable[Finding]) -> int:
+    # Map the requested failure threshold to process status without changing the report contents.
     statuses = {finding.status for finding in findings}
     if fail_on == "never":
         return 0
@@ -1978,6 +2058,7 @@ def version_key(value: str) -> tuple[list[int], str]:
 
 
 def version_matches(version: str, constraint: str) -> bool:
+    # Support comma-separated constraints such as ">=1.0,<2.0" for local advisory matching.
     constraint = constraint.strip()
     if constraint in {"", "*"}:
         return True

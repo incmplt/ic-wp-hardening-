@@ -192,8 +192,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cve-match",
         choices=("cpe", "keyword", "both"),
-        default="both",
-        help="CVE search strategy. CPE matches are higher confidence. Default: both.",
+        default="cpe",
+        help="CVE search strategy. Keyword fallback can be noisy and request-heavy. Default: cpe.",
     )
     parser.add_argument(
         "--cve-map",
@@ -1202,7 +1202,10 @@ def check_cves(
             "cve-search",
             "INFO",
             "NVD CVE search is enabled.",
-            "This product uses data from the NVD API but is not endorsed or certified by the NVD.",
+            (
+                "This product uses data from the NVD API but is not endorsed or certified by the NVD. "
+                f"NVD_API_KEY configured: {'yes' if nvd_api_key else 'no'}."
+            ),
             source="nvd",
         ),
         *map_findings,
@@ -1217,6 +1220,8 @@ def check_cves(
     keyword_targets_used = 0
     request_count = 0
     match_count = 0
+    transient_error_count = 0
+    unmapped_targets: list[CveTarget] = []
 
     for target in targets:
         target_cpes = cpe_values_for_target(target, cve_map)
@@ -1249,6 +1254,18 @@ def check_cves(
                 )
                 if payload:
                     match_count += len(payload.get("vulnerabilities", []))
+                transient_error_count = update_transient_error_count(transient_error_count, error)
+                if transient_error_count >= 3:
+                    findings.append(nvd_circuit_breaker_finding(transient_error_count))
+                    return finalize_cve_findings(
+                        findings,
+                        request_count,
+                        match_count,
+                        keyword_targets_used,
+                        cve_max_keyword_targets,
+                        cve_match,
+                        unmapped_targets,
+                    )
                 sleep_after_nvd_request(delay, from_cache)
             continue
 
@@ -1279,19 +1296,56 @@ def check_cves(
             )
             if payload:
                 match_count += len(payload.get("vulnerabilities", []))
+            transient_error_count = update_transient_error_count(transient_error_count, error)
+            if transient_error_count >= 3:
+                findings.append(nvd_circuit_breaker_finding(transient_error_count))
+                return finalize_cve_findings(
+                    findings,
+                    request_count,
+                    match_count,
+                    keyword_targets_used,
+                    cve_max_keyword_targets,
+                    cve_match,
+                    unmapped_targets,
+                )
             sleep_after_nvd_request(delay, from_cache)
         elif cve_match == "cpe" and not target_cpes:
-            findings.append(
-                Finding(
-                    "cve-search",
-                    "INFO",
-                    f"No CPE mapping for {target.kind} {target.slug}.",
-                    "Provide --cve-map to enable high-confidence CPE matching.",
-                    path=target.path,
-                    source="nvd",
-                )
-            )
+            unmapped_targets.append(target)
 
+    return finalize_cve_findings(
+        findings,
+        request_count,
+        match_count,
+        keyword_targets_used,
+        cve_max_keyword_targets,
+        cve_match,
+        unmapped_targets,
+    )
+
+
+def finalize_cve_findings(
+    findings: list[Finding],
+    request_count: int,
+    match_count: int,
+    keyword_targets_used: int,
+    cve_max_keyword_targets: int,
+    cve_match: str,
+    unmapped_targets: list[CveTarget],
+) -> list[Finding]:
+    if cve_match == "cpe" and unmapped_targets:
+        examples = ", ".join(f"{target.kind}:{target.slug}" for target in unmapped_targets[:10])
+        if len(unmapped_targets) > 10:
+            examples += ", ..."
+        findings.append(
+            Finding(
+                "cve-search",
+                "INFO",
+                f"Skipped {len(unmapped_targets)} plugin/theme target(s) without CPE mappings.",
+                f"examples: {examples}",
+                remediation="Provide --cve-map or use --cve-match keyword/both for lower-confidence keyword searches.",
+                source="nvd",
+            )
+        )
     if cve_match in {"keyword", "both"} and keyword_targets_used >= cve_max_keyword_targets:
         findings.append(
             Finding(
@@ -1309,8 +1363,35 @@ def check_cves(
             f"NVD CVE search completed with {request_count} request(s) and {match_count} raw match(es).",
             source="nvd",
         )
-    )
+        )
     return findings
+
+
+def update_transient_error_count(current_count: int, error: str) -> int:
+    if not error:
+        return 0
+    if is_transient_nvd_error(error):
+        return current_count + 1
+    return 0
+
+
+def is_transient_nvd_error(error: str) -> bool:
+    lowered = error.lower()
+    return any(marker in lowered for marker in ("http 429", "http 503", "timed out", "temporarily unavailable"))
+
+
+def nvd_circuit_breaker_finding(error_count: int) -> Finding:
+    return Finding(
+        "cve-search",
+        "WARN",
+        "Stopped NVD CVE search after repeated transient NVD failures.",
+        f"consecutive transient failures: {error_count}",
+        remediation=(
+            "Retry later, configure NVD_API_KEY in .env, reduce targets with --cve-match cpe, "
+            "or use --cve-cache to reuse prior responses."
+        ),
+        source="nvd",
+    )
 
 
 def build_cve_targets(root: Path, core_version: str, plugins: list[Plugin], themes: list[Theme]) -> list[CveTarget]:

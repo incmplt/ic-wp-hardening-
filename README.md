@@ -101,12 +101,12 @@ ic-wp-hardening /path/to/wordpress --cve-check -o report.md
 検索方法:
 
 ```bash
-ic-wp-hardening /path/to/wordpress --cve-check --cve-match both
 ic-wp-hardening /path/to/wordpress --cve-check --cve-match cpe
 ic-wp-hardening /path/to/wordpress --cve-check --cve-match keyword
+ic-wp-hardening /path/to/wordpress --cve-check --cve-match both
 ```
 
-`cpe` は CPE による高信頼の検索です。WordPress core は組み込みの CPE テンプレートを使います。プラグインやテーマは CPE が安定して付いていないことがあるため、必要に応じて `--cve-map` で対応表を渡します。
+デフォルトは `cpe` です。`cpe` は CPE による高信頼の検索です。WordPress core は組み込みの CPE テンプレートを使います。プラグインやテーマは CPE が安定して付いていないことがあるため、必要に応じて `--cve-map` で対応表を渡します。
 
 ```bash
 ic-wp-hardening /path/to/wordpress --cve-check --cve-map cve-map.json
@@ -125,7 +125,7 @@ ic-wp-hardening /path/to/wordpress --cve-check --cve-map cve-map.json
 }
 ```
 
-`keyword` は `WordPress <plugin name> <slug>` のようなキーワード検索です。誤検知や見逃しがあり得るため、レポートでは potential match として扱います。
+`keyword` は `WordPress <plugin name> <slug>` のようなキーワード検索です。誤検知や見逃しがあり得るため、レポートでは potential match として扱います。NVD へのリクエスト数も増えるため、必要な場合だけ `--cve-match keyword` または `--cve-match both` を指定してください。
 
 NVD API のレスポンスをキャッシュする場合:
 

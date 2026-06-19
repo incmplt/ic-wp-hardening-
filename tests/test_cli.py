@@ -145,12 +145,81 @@ class CliTests(unittest.TestCase):
         findings = report["findings"]
         cve_findings = [finding for finding in findings if finding["check"] == "cve"]
         self.assertTrue(any("cpeName" in call for call in calls))
+        self.assertFalse(any("keywordSearch" in call for call in calls))
         self.assertIn("test-nvd-key", api_keys)
         self.assertEqual(cve_findings[0]["source"], "nvd:cpe")
         self.assertIn("CVE-2024-0001", cve_findings[0]["message"])
         evidence = json.loads(cve_findings[0]["evidence"])
         self.assertEqual(evidence["id"], "CVE-2024-0001")
         self.assertEqual(evidence["target"]["slug"], "example-plugin")
+
+    def test_cve_check_stops_after_repeated_transient_nvd_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_wordpress_fixture(Path(tmp))
+            cve_map = Path(tmp) / "cve-map.json"
+            cve_map.write_text(
+                json.dumps(
+                    {
+                        "plugins": {
+                            "example-plugin": (
+                                "cpe:2.3:a:example:example_plugin:{version}:*:*:*:*:wordpress:*:*"
+                            )
+                        },
+                        "themes": {
+                            "example-theme": (
+                                "cpe:2.3:a:example:example_theme:{version}:*:*:*:*:wordpress:*:*"
+                            )
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calls: list[dict[str, str]] = []
+            original_fetch = cli.fetch_nvd_cves
+
+            def fake_fetch(
+                params: dict[str, str],
+                nvd_api_key: str,
+                timeout: float,
+                cache: dict[str, object],
+                cache_path: Path | None,
+            ) -> tuple[None, str, bool]:
+                calls.append(params)
+                return None, "NVD API HTTP 503: Service Unavailable", False
+
+            cli.fetch_nvd_cves = fake_fetch
+            try:
+                output = run_cli_capture(
+                    [
+                        str(root),
+                        "--format",
+                        "json",
+                        "--use-wp-cli",
+                        "never",
+                        "--php-ini",
+                        str(root / "php.ini"),
+                        "--cve-check",
+                        "--cve-map",
+                        str(cve_map),
+                        "--nvd-delay",
+                        "0",
+                        "--fail-on",
+                        "never",
+                    ]
+                )
+            finally:
+                cli.fetch_nvd_cves = original_fetch
+
+        report = json.loads(output)
+        findings = report["findings"]
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(
+            any(
+                finding["check"] == "cve-search"
+                and "Stopped NVD CVE search" in finding["message"]
+                for finding in findings
+            )
+        )
 
 
 def run_cli_capture(argv: list[str]) -> str:

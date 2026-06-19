@@ -101,12 +101,12 @@ ic-wp-hardening /path/to/wordpress --cve-check -o report.md
 Search strategies:
 
 ```bash
-ic-wp-hardening /path/to/wordpress --cve-check --cve-match both
 ic-wp-hardening /path/to/wordpress --cve-check --cve-match cpe
 ic-wp-hardening /path/to/wordpress --cve-check --cve-match keyword
+ic-wp-hardening /path/to/wordpress --cve-check --cve-match both
 ```
 
-`cpe` is a higher-confidence search based on CPE names. WordPress core uses a built-in CPE template. Plugins and themes do not always have stable CPE coverage, so you can provide mappings with `--cve-map`.
+The default is `cpe`. `cpe` is a higher-confidence search based on CPE names. WordPress core uses a built-in CPE template. Plugins and themes do not always have stable CPE coverage, so you can provide mappings with `--cve-map`.
 
 ```bash
 ic-wp-hardening /path/to/wordpress --cve-check --cve-map cve-map.json
@@ -125,7 +125,7 @@ Example `cve-map.json`:
 }
 ```
 
-`keyword` searches use terms such as `WordPress <plugin name> <slug>`. Because keyword search can produce false positives or miss records, these results are reported as potential matches.
+`keyword` searches use terms such as `WordPress <plugin name> <slug>`. Because keyword search can produce false positives or miss records, these results are reported as potential matches. It also increases NVD request volume, so use `--cve-match keyword` or `--cve-match both` only when needed.
 
 To cache NVD API responses:
 

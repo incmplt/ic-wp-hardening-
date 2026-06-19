@@ -1,0 +1,13 @@
+[project]
+name = "ic-wp-hardening"
+version = "0.1.0"
+description = "WordPress security batch-check CLI that outputs Markdown reports."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+ic-wp-hardening = "ic_wp_hardening.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

@@ -72,6 +72,102 @@ class CliTests(unittest.TestCase):
             any(f["check"] == "wp-config" and f["source"] == "wp-cli" for f in findings)
         )
 
+    def test_reports_exposed_files_uploads_php_and_additional_wp_config_risks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_wordpress_fixture(Path(tmp))
+            uploads = root / "wp-content" / "uploads" / "2026" / "06"
+            uploads.mkdir(parents=True)
+            (root / "readme.html").write_text("WordPress readme\n", encoding="utf-8")
+            (root / "backup.sql").write_text("-- dump\n", encoding="utf-8")
+            (root / "wp-config.php~").write_text("backup\n", encoding="utf-8")
+            (root / "wp-content" / "debug.log").write_text("debug\n", encoding="utf-8")
+            (uploads / "shell.php").write_text("<?php echo 'owned';\n", encoding="utf-8")
+            (uploads / "avatar.php.jpg").write_text("GIF89a\n", encoding="utf-8")
+            config_path = root / "wp-config.php"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8")
+                + "define('DISALLOW_FILE_MODS', false);\n"
+                + "define('WP_DEBUG_LOG', true);\n"
+                + "define('SCRIPT_DEBUG', true);\n"
+                + "define('AUTOMATIC_UPDATER_DISABLED', true);\n"
+                + "define('WP_AUTO_UPDATE_CORE', false);\n"
+                + "define('WP_ENVIRONMENT_TYPE', 'development');\n",
+                encoding="utf-8",
+            )
+
+            output = run_cli_capture(
+                [
+                    str(root),
+                    "--format",
+                    "json",
+                    "--use-wp-cli",
+                    "never",
+                    "--php-ini",
+                    str(root / "php.ini"),
+                    "--fail-on",
+                    "never",
+                ]
+            )
+
+        report = json.loads(output)
+        findings = report["findings"]
+        self.assertTrue(
+            any(
+                f["check"] == "exposed-files"
+                and f["status"] == "FAIL"
+                and "backup.sql" in f["message"]
+                for f in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                f["check"] == "exposed-files"
+                and f["status"] == "FAIL"
+                and "wp-config.php~" in f["message"]
+                for f in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                f["check"] == "exposed-files"
+                and f["status"] == "WARN"
+                and "debug.log" in f["message"]
+                for f in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                f["check"] == "uploads-php"
+                and f["status"] == "FAIL"
+                and "shell.php" in f["message"]
+                for f in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                f["check"] == "uploads-php"
+                and f["status"] == "FAIL"
+                and "avatar.php.jpg" in f["message"]
+                for f in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                f["check"] == "wp-config"
+                and f["status"] == "WARN"
+                and "DISALLOW_FILE_MODS is disabled" in f["message"]
+                for f in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                f["check"] == "wp-config"
+                and f["status"] == "WARN"
+                and "WP_ENVIRONMENT_TYPE is development" in f["message"]
+                for f in findings
+            )
+        )
+
     def test_cve_check_uses_nvd_client_and_reports_cpe_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_wordpress_fixture(Path(tmp))

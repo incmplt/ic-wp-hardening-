@@ -55,6 +55,8 @@ When WP-CLI is available, the tool can inspect plugin and theme activation state
 - Theme detection, and activation/update state when WP-CLI is available
 - Must-use plugin (`wp-content/mu-plugins`) detection
 - Key `wp-config.php` hardening settings
+- Detection of exposed backups, database dumps, archives, and debug logs
+- Detection of PHP-capable or disguised PHP files under `wp-content/uploads`
 - File, directory, and `wp-config.php` permission checks
 - PHP setting checks from `php.ini` or `php -i`
 
@@ -145,6 +147,12 @@ ic-wp-hardening /path/to/wordpress --format json -o report.json
 ```
 
 The JSON report contains `summary` and `findings`. Each finding includes `check`, `status`, `message`, `detail`, `path`, `remediation`, `evidence`, and `source`.
+
+To increase the number of reported file-scan findings:
+
+```bash
+ic-wp-hardening /path/to/wordpress --max-file-scan-findings 50 -o report.md
+```
 
 ## Plugin Vulnerability Database
 

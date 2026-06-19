@@ -127,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
             args.timeout,
         )
     )
+    findings.extend(check_exposed_files(root, args.max_file_scan_findings))
+    findings.extend(check_uploads_php(root, args.max_file_scan_findings))
     findings.extend(check_permissions(root, args.max_permission_findings))
     findings.extend(check_php_settings(args.php_ini, args.php_bin))
 
@@ -227,6 +229,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=25,
         help="Maximum individual permission paths shown in the report. Default: 25.",
+    )
+    parser.add_argument(
+        "--max-file-scan-findings",
+        type=int,
+        default=25,
+        help="Maximum exposed-file/upload PHP paths shown in the report. Default: 25.",
     )
     parser.add_argument(
         "--fail-on",
@@ -570,6 +578,35 @@ def evaluate_wp_config_values(values: dict[str, str], config_path: Path) -> list
             )
         )
 
+    disallow_file_mods = values.get("DISALLOW_FILE_MODS")
+    if disallow_file_mods is None:
+        findings.append(
+            Finding(
+                "wp-config",
+                "INFO",
+                "DISALLOW_FILE_MODS is not defined.",
+                path=str(config_path),
+            )
+        )
+    elif normalize_php_bool(disallow_file_mods) == "on":
+        findings.append(
+            Finding("wp-config", "PASS", "DISALLOW_FILE_MODS is enabled.", path=str(config_path))
+        )
+    else:
+        findings.append(
+            Finding(
+                "wp-config",
+                "WARN",
+                "DISALLOW_FILE_MODS is disabled.",
+                "Plugin/theme installs and updates may be allowed from wp-admin.",
+                remediation=(
+                    "Enable DISALLOW_FILE_MODS on locked-down production sites "
+                    "if operationally feasible."
+                ),
+                path=str(config_path),
+            )
+        )
+
     wp_debug = values.get("WP_DEBUG")
     if wp_debug is None:
         findings.append(Finding("wp-config", "INFO", "WP_DEBUG is not defined.", path=str(config_path)))
@@ -586,6 +623,50 @@ def evaluate_wp_config_values(values: dict[str, str], config_path: Path) -> list
     else:
         findings.append(Finding("wp-config", "PASS", "WP_DEBUG is disabled.", path=str(config_path)))
 
+    wp_debug_log = values.get("WP_DEBUG_LOG")
+    if wp_debug_log is None:
+        findings.append(
+            Finding("wp-config", "INFO", "WP_DEBUG_LOG is not defined.", path=str(config_path))
+        )
+    elif normalize_php_bool(wp_debug_log) == "on":
+        findings.append(
+            Finding(
+                "wp-config",
+                "WARN",
+                "WP_DEBUG_LOG is enabled.",
+                "Debug logs can disclose sensitive details if exposed under wp-content.",
+                remediation=(
+                    "Disable WP_DEBUG_LOG on production sites or ensure logs are not "
+                    "web-accessible."
+                ),
+                path=str(config_path),
+            )
+        )
+    else:
+        findings.append(
+            Finding("wp-config", "PASS", "WP_DEBUG_LOG is disabled.", path=str(config_path))
+        )
+
+    script_debug = values.get("SCRIPT_DEBUG")
+    if script_debug is None:
+        findings.append(
+            Finding("wp-config", "INFO", "SCRIPT_DEBUG is not defined.", path=str(config_path))
+        )
+    elif normalize_php_bool(script_debug) == "on":
+        findings.append(
+            Finding(
+                "wp-config",
+                "WARN",
+                "SCRIPT_DEBUG is enabled.",
+                remediation="Disable SCRIPT_DEBUG on production sites.",
+                path=str(config_path),
+            )
+        )
+    else:
+        findings.append(
+            Finding("wp-config", "PASS", "SCRIPT_DEBUG is disabled.", path=str(config_path))
+        )
+
     force_ssl_admin = values.get("FORCE_SSL_ADMIN")
     if force_ssl_admin is None:
         findings.append(Finding("wp-config", "INFO", "FORCE_SSL_ADMIN is not defined.", path=str(config_path)))
@@ -593,6 +674,103 @@ def evaluate_wp_config_values(values: dict[str, str], config_path: Path) -> list
         findings.append(Finding("wp-config", "PASS", "FORCE_SSL_ADMIN is enabled.", path=str(config_path)))
     else:
         findings.append(Finding("wp-config", "WARN", "FORCE_SSL_ADMIN is disabled.", path=str(config_path)))
+
+    automatic_updater_disabled = values.get("AUTOMATIC_UPDATER_DISABLED")
+    if automatic_updater_disabled is None:
+        findings.append(
+            Finding(
+                "wp-config",
+                "INFO",
+                "AUTOMATIC_UPDATER_DISABLED is not defined.",
+                path=str(config_path),
+            )
+        )
+    elif normalize_php_bool(automatic_updater_disabled) == "on":
+        findings.append(
+            Finding(
+                "wp-config",
+                "WARN",
+                "AUTOMATIC_UPDATER_DISABLED is enabled.",
+                remediation=(
+                    "Keep automatic updates enabled unless updates are handled by another "
+                    "controlled process."
+                ),
+                path=str(config_path),
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                "wp-config",
+                "PASS",
+                "AUTOMATIC_UPDATER_DISABLED is disabled.",
+                path=str(config_path),
+            )
+        )
+
+    wp_auto_update_core = values.get("WP_AUTO_UPDATE_CORE")
+    if wp_auto_update_core is None:
+        findings.append(
+            Finding(
+                "wp-config",
+                "INFO",
+                "WP_AUTO_UPDATE_CORE is not defined.",
+                path=str(config_path),
+            )
+        )
+    elif normalize_php_bool(wp_auto_update_core) == "off":
+        findings.append(
+            Finding(
+                "wp-config",
+                "WARN",
+                "WordPress core automatic updates are disabled.",
+                remediation=(
+                    "Allow at least minor core automatic updates or document the manual "
+                    "patch process."
+                ),
+                path=str(config_path),
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                "wp-config",
+                "PASS",
+                f"WP_AUTO_UPDATE_CORE is configured: {wp_auto_update_core}.",
+                path=str(config_path),
+            )
+        )
+
+    environment_type = values.get("WP_ENVIRONMENT_TYPE")
+    if environment_type is None:
+        findings.append(
+            Finding(
+                "wp-config",
+                "INFO",
+                "WP_ENVIRONMENT_TYPE is not defined.",
+                path=str(config_path),
+            )
+        )
+    elif environment_type.lower() == "production":
+        findings.append(
+            Finding(
+                "wp-config",
+                "PASS",
+                "WP_ENVIRONMENT_TYPE is production.",
+                path=str(config_path),
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                "wp-config",
+                "WARN",
+                f"WP_ENVIRONMENT_TYPE is {environment_type}.",
+                "Production sites should not identify as local, development, or staging.",
+                remediation="Set WP_ENVIRONMENT_TYPE to production on live sites.",
+                path=str(config_path),
+            )
+        )
 
     if values.get("table_prefix") == "wp_":
         findings.append(
@@ -1807,6 +1985,232 @@ def check_wp_cli_checksums(
             )
         )
     return findings
+
+
+def check_exposed_files(root: Path, max_findings: int) -> list[Finding]:
+    # Detect files commonly left behind after installs, backups, debugging, or
+    # manual maintenance. These can disclose versions, credentials, or database dumps.
+    findings: list[Finding] = []
+    checked_files = 0
+    reported = 0
+    suppressed = 0
+
+    for path in iter_scannable_files(root):
+        checked_files += 1
+        finding = evaluate_exposed_file(path, root)
+        if finding:
+            if reported < max_findings:
+                findings.append(finding)
+                reported += 1
+            else:
+                suppressed += 1
+
+    summary = f"Checked {checked_files} file(s)."
+    if not findings and suppressed == 0:
+        return [
+            Finding(
+                "exposed-files",
+                "PASS",
+                "No exposed backup, dump, archive, or debug files were detected.",
+                summary,
+            )
+        ]
+
+    findings.insert(
+        0,
+        Finding("exposed-files", "WARN", "Potentially exposed files were detected.", summary),
+    )
+    if suppressed:
+        findings.append(
+            Finding(
+                "exposed-files",
+                "WARN",
+                f"Suppressed {suppressed} additional exposed-file finding(s).",
+                f"Increase --max-file-scan-findings above {max_findings} to show more.",
+            )
+        )
+    return findings
+
+
+def evaluate_exposed_file(path: Path, root: Path) -> Finding | None:
+    rel = safe_relative(path, root)
+    name = path.name.lower()
+    rel_lower = rel.lower()
+
+    if name.startswith("wp-config.php") and name != "wp-config.php":
+        return Finding(
+            "exposed-files",
+            "FAIL",
+            f"wp-config.php backup or temporary file is present: {rel}.",
+            remediation="Remove configuration backups from the document root.",
+            path=str(path),
+        )
+
+    dump_suffixes = (".sql", ".sql.gz", ".sql.zip", ".sql.bz2", ".sql.xz")
+    if rel_lower.endswith(dump_suffixes):
+        return Finding(
+            "exposed-files",
+            "FAIL",
+            f"Database dump file is present: {rel}.",
+            remediation=(
+                "Move database dumps outside the document root and rotate exposed "
+                "credentials."
+            ),
+            path=str(path),
+        )
+
+    if name in {"debug.log", "error_log", "php_errorlog"}:
+        return Finding(
+            "exposed-files",
+            "WARN",
+            f"Debug or error log file is present: {rel}.",
+            remediation="Move logs outside the document root or block direct web access.",
+            path=str(path),
+        )
+
+    if rel_lower in {"readme.html", "install.php"}:
+        return Finding(
+            "exposed-files",
+            "WARN",
+            f"Public WordPress metadata or installer file is present: {rel}.",
+            remediation="Remove public metadata/install files when they are not required.",
+            path=str(path),
+        )
+
+    backup_suffixes = (".bak", ".old", ".orig", ".save", ".swp", ".tmp", "~")
+    if rel_lower.endswith(backup_suffixes):
+        return Finding(
+            "exposed-files",
+            "WARN",
+            f"Backup or temporary file is present: {rel}.",
+            remediation="Remove backup and temporary files from the document root.",
+            path=str(path),
+        )
+
+    archive_suffixes = (".zip", ".tar", ".tar.gz", ".tgz", ".rar", ".7z")
+    if rel_lower.endswith(archive_suffixes):
+        return Finding(
+            "exposed-files",
+            "WARN",
+            f"Archive file is present under the document root: {rel}.",
+            remediation=(
+                "Move archives outside the document root unless direct download is "
+                "intentional."
+            ),
+            path=str(path),
+        )
+
+    return None
+
+
+def check_uploads_php(root: Path, max_findings: int) -> list[Finding]:
+    uploads_dir = root / "wp-content" / "uploads"
+    if not uploads_dir.exists():
+        return [Finding("uploads-php", "INFO", "No wp-content/uploads directory was detected.")]
+
+    findings: list[Finding] = []
+    checked_files = 0
+    reported = 0
+    suppressed = 0
+
+    for path in iter_scannable_files(uploads_dir):
+        checked_files += 1
+        finding = evaluate_uploads_php_file(path, root)
+        if finding:
+            if reported < max_findings:
+                findings.append(finding)
+                reported += 1
+            else:
+                suppressed += 1
+
+    summary = f"Checked {checked_files} upload file(s)."
+    if not findings and suppressed == 0:
+        return [
+            Finding(
+                "uploads-php",
+                "PASS",
+                "No PHP-capable files were detected in uploads.",
+                summary,
+            )
+        ]
+
+    findings.insert(
+        0,
+        Finding("uploads-php", "FAIL", "PHP-capable files were detected in uploads.", summary),
+    )
+    if suppressed:
+        findings.append(
+            Finding(
+                "uploads-php",
+                "WARN",
+                f"Suppressed {suppressed} additional uploads PHP finding(s).",
+                f"Increase --max-file-scan-findings above {max_findings} to show more.",
+            )
+        )
+    return findings
+
+
+def evaluate_uploads_php_file(path: Path, root: Path) -> Finding | None:
+    rel = safe_relative(path, root)
+    name = path.name.lower()
+    executable_suffixes = (
+        ".php",
+        ".phtml",
+        ".php3",
+        ".php4",
+        ".php5",
+        ".php7",
+        ".phps",
+        ".pht",
+        ".phar",
+    )
+    disguised_markers = (".php.", ".phtml.", ".pht.", ".phar.")
+
+    if name.endswith(executable_suffixes):
+        return Finding(
+            "uploads-php",
+            "FAIL",
+            f"PHP-capable file is present in uploads: {rel}.",
+            remediation="Remove the file and investigate how executable content reached uploads.",
+            path=str(path),
+        )
+
+    if any(marker in name for marker in disguised_markers):
+        return Finding(
+            "uploads-php",
+            "FAIL",
+            f"Disguised PHP-like filename is present in uploads: {rel}.",
+            remediation="Remove the file and investigate whether upload filtering was bypassed.",
+            path=str(path),
+        )
+
+    if file_contains_php_tag(path):
+        return Finding(
+            "uploads-php",
+            "FAIL",
+            f"PHP code marker was found in an upload file: {rel}.",
+            remediation="Remove the file and investigate possible webshell activity.",
+            path=str(path),
+        )
+
+    return None
+
+
+def file_contains_php_tag(path: Path) -> bool:
+    try:
+        sample = path.read_bytes()[:8192]
+    except OSError:
+        return False
+    lowered = sample.lower()
+    return b"<?php" in lowered or b"<?=" in lowered
+
+
+def iter_scannable_files(root: Path) -> Iterable[Path]:
+    for current_root, dirs, files in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in {".git", "node_modules", "vendor"}]
+        current = Path(current_root)
+        for name in sorted(files):
+            yield current / name
 
 
 def check_permissions(root: Path, max_findings: int) -> list[Finding]:

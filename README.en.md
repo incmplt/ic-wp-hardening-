@@ -35,6 +35,12 @@ To specify a PHP configuration file:
 ic-wp-hardening /path/to/wordpress --php-ini /etc/php.ini -o report.md
 ```
 
+When the WordPress root and the web server DocumentRoot are different:
+
+```bash
+ic-wp-hardening /var/www/html/wp --document-root /var/www/html -o report.md
+```
+
 To explicitly use WP-CLI:
 
 ```bash
@@ -153,6 +159,24 @@ To increase the number of reported file-scan findings:
 ```bash
 ic-wp-hardening /path/to/wordpress --max-file-scan-findings 50 -o report.md
 ```
+
+## DocumentRoot Dangerous File Detection
+
+If WordPress is installed below the DocumentRoot, such as `/var/www/html/wp/`, pass `--document-root` to scan the whole DocumentRoot for dangerous files.
+
+```bash
+ic-wp-hardening /var/www/html/wp --document-root /var/www/html -o report.md
+```
+
+Examples:
+
+- `.env`
+- `.git/config`
+- `wp-config.php~`
+- `readme.html`
+- `debug.log`
+- `*.sql`
+- `*.zip`
 
 ## Plugin Vulnerability Database
 

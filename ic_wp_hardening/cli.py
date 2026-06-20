@@ -65,6 +65,7 @@ class CveTarget:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = args.wp_root.resolve()
+    document_root = args.document_root.resolve() if args.document_root else root
     load_env_files(root)
 
     # Collect findings in the same order they should appear in the report:
@@ -127,7 +128,13 @@ def main(argv: list[str] | None = None) -> int:
             args.timeout,
         )
     )
-    findings.extend(check_exposed_files(root, args.max_file_scan_findings))
+    findings.extend(
+        check_exposed_files(
+            scan_root=document_root,
+            max_findings=args.max_file_scan_findings,
+            wp_root=root,
+        )
+    )
     findings.extend(check_uploads_php(root, args.max_file_scan_findings))
     findings.extend(check_permissions(root, args.max_permission_findings))
     findings.extend(check_php_settings(args.php_ini, args.php_bin))
@@ -143,8 +150,16 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ic-wp-hardening",
         description="Check a local WordPress installation and output a security report.",
     )
-    parser.add_argument("wp_root", type=Path, help="Path to the WordPress document root.")
+    parser.add_argument("wp_root", type=Path, help="Path to the WordPress installation root.")
     parser.add_argument("-o", "--output", type=Path, help="Write report to this file.")
+    parser.add_argument(
+        "--document-root",
+        type=Path,
+        help=(
+            "Path to the web server DocumentRoot for exposed-file checks. "
+            "Defaults to the WordPress root."
+        ),
+    )
     parser.add_argument(
         "--format",
         choices=("markdown", "json"),
@@ -1987,17 +2002,40 @@ def check_wp_cli_checksums(
     return findings
 
 
-def check_exposed_files(root: Path, max_findings: int) -> list[Finding]:
+def check_exposed_files(
+    scan_root: Path,
+    max_findings: int,
+    wp_root: Path | None = None,
+) -> list[Finding]:
     # Detect files commonly left behind after installs, backups, debugging, or
     # manual maintenance. These can disclose versions, credentials, or database dumps.
+    if not scan_root.exists():
+        return [
+            Finding(
+                "exposed-files",
+                "WARN",
+                "Exposed-file scan root does not exist.",
+                path=str(scan_root),
+            )
+        ]
+    if not scan_root.is_dir():
+        return [
+            Finding(
+                "exposed-files",
+                "WARN",
+                "Exposed-file scan root is not a directory.",
+                path=str(scan_root),
+            )
+        ]
+
     findings: list[Finding] = []
     checked_files = 0
     reported = 0
     suppressed = 0
 
-    for path in iter_scannable_files(root):
+    for path in iter_scannable_files(scan_root):
         checked_files += 1
-        finding = evaluate_exposed_file(path, root)
+        finding = evaluate_exposed_file(path, scan_root)
         if finding:
             if reported < max_findings:
                 findings.append(finding)
@@ -2006,19 +2044,30 @@ def check_exposed_files(root: Path, max_findings: int) -> list[Finding]:
                 suppressed += 1
 
     summary = f"Checked {checked_files} file(s)."
+    separate_root_detail = ""
+    if wp_root is not None and scan_root != wp_root:
+        separate_root_detail = f"DocumentRoot: {scan_root}\nWordPress root: {wp_root}"
+
     if not findings and suppressed == 0:
         return [
             Finding(
                 "exposed-files",
                 "PASS",
                 "No exposed backup, dump, archive, or debug files were detected.",
-                summary,
+                "\n".join(part for part in [summary, separate_root_detail] if part),
+                path=str(scan_root),
             )
         ]
 
     findings.insert(
         0,
-        Finding("exposed-files", "WARN", "Potentially exposed files were detected.", summary),
+        Finding(
+            "exposed-files",
+            "WARN",
+            "Potentially exposed files were detected.",
+            summary,
+            path=str(scan_root),
+        ),
     )
     if suppressed:
         findings.append(
@@ -2029,6 +2078,16 @@ def check_exposed_files(root: Path, max_findings: int) -> list[Finding]:
                 f"Increase --max-file-scan-findings above {max_findings} to show more.",
             )
         )
+    if separate_root_detail:
+        findings.append(
+            Finding(
+                "exposed-files",
+                "INFO",
+                "Exposed-file scan used a separate DocumentRoot.",
+                separate_root_detail,
+                path=str(scan_root),
+            )
+        )
     return findings
 
 
@@ -2036,6 +2095,33 @@ def evaluate_exposed_file(path: Path, root: Path) -> Finding | None:
     rel = safe_relative(path, root)
     name = path.name.lower()
     rel_lower = rel.lower()
+
+    if name == ".env" or name.startswith((".env.", ".env~")):
+        return Finding(
+            "exposed-files",
+            "FAIL",
+            f"Environment file is present under the document root: {rel}.",
+            remediation="Move environment files outside the document root.",
+            path=str(path),
+        )
+
+    vcs_metadata = {
+        ".git/config": "Git metadata",
+        ".svn/entries": "Subversion metadata",
+        ".hg/hgrc": "Mercurial metadata",
+    }
+    for suffix, label in vcs_metadata.items():
+        if rel_lower == suffix or rel_lower.endswith(f"/{suffix}"):
+            return Finding(
+                "exposed-files",
+                "FAIL",
+                f"{label} is present under the document root: {rel}.",
+                remediation=(
+                    "Remove VCS metadata from the document root or block direct "
+                    "web access."
+                ),
+                path=str(path),
+            )
 
     if name.startswith("wp-config.php") and name != "wp-config.php":
         return Finding(
@@ -2068,7 +2154,7 @@ def evaluate_exposed_file(path: Path, root: Path) -> Finding | None:
             path=str(path),
         )
 
-    if rel_lower in {"readme.html", "install.php"}:
+    if name == "readme.html" or rel_lower == "install.php":
         return Finding(
             "exposed-files",
             "WARN",
@@ -2207,7 +2293,7 @@ def file_contains_php_tag(path: Path) -> bool:
 
 def iter_scannable_files(root: Path) -> Iterable[Path]:
     for current_root, dirs, files in os.walk(root):
-        dirs[:] = [name for name in dirs if name not in {".git", "node_modules", "vendor"}]
+        dirs[:] = [name for name in dirs if name not in {"node_modules", "vendor"}]
         current = Path(current_root)
         for name in sorted(files):
             yield current / name

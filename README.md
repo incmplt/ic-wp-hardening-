@@ -35,6 +35,12 @@ PHP 設定ファイルを明示する場合:
 ic-wp-hardening /path/to/wordpress --php-ini /etc/php.ini -o report.md
 ```
 
+WordPress ルートと Web サーバーの DocumentRoot が異なる場合:
+
+```bash
+ic-wp-hardening /var/www/html/wp --document-root /var/www/html -o report.md
+```
+
 WP-CLI を明示的に使う場合:
 
 ```bash
@@ -153,6 +159,24 @@ JSON には `summary` と `findings` が含まれます。各 finding には `ch
 ```bash
 ic-wp-hardening /path/to/wordpress --max-file-scan-findings 50 -o report.md
 ```
+
+## DocumentRoot の危険ファイル検出
+
+WordPress が DocumentRoot 直下ではなく、`/var/www/html/wp/` のようなサブディレクトリにインストールされている場合は、`--document-root` を指定すると DocumentRoot 全体の危険ファイルを検査できます。
+
+```bash
+ic-wp-hardening /var/www/html/wp --document-root /var/www/html -o report.md
+```
+
+対象例:
+
+- `.env`
+- `.git/config`
+- `wp-config.php~`
+- `readme.html`
+- `debug.log`
+- `*.sql`
+- `*.zip`
 
 ## プラグイン脆弱性 DB
 

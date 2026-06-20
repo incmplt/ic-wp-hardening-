@@ -168,6 +168,68 @@ class CliTests(unittest.TestCase):
             )
         )
 
+    def test_exposed_files_can_scan_document_root_above_wordpress_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            document_root = Path(tmp) / "html"
+            wp_parent = document_root / "hogehoge"
+            root = make_wordpress_fixture(wp_parent)
+            (document_root / "backup.sql").write_text("-- dump\n", encoding="utf-8")
+            (document_root / ".git").mkdir()
+            (document_root / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+            (document_root / "debug.log").write_text("debug output\n", encoding="utf-8")
+
+            output = run_cli_capture(
+                [
+                    str(root),
+                    "--document-root",
+                    str(document_root),
+                    "--format",
+                    "json",
+                    "--use-wp-cli",
+                    "never",
+                    "--php-ini",
+                    str(root / "php.ini"),
+                    "--fail-on",
+                    "never",
+                ]
+            )
+
+        report = json.loads(output)
+        findings = [
+            finding for finding in report["findings"] if finding["check"] == "exposed-files"
+        ]
+        self.assertTrue(
+            any(
+                finding["status"] == "FAIL"
+                and "backup.sql" in finding["message"]
+                and finding["path"] == str((document_root / "backup.sql").resolve())
+                for finding in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                finding["status"] == "FAIL"
+                and ".git/config" in finding["message"]
+                and finding["path"] == str((document_root / ".git" / "config").resolve())
+                for finding in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                finding["status"] == "WARN" and "debug.log" in finding["message"]
+                for finding in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                finding["status"] == "INFO"
+                and "DocumentRoot" in finding["detail"]
+                and "WordPress root" in finding["detail"]
+                and finding["path"] == str(document_root.resolve())
+                for finding in findings
+            )
+        )
+
     def test_cve_check_uses_nvd_client_and_reports_cpe_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_wordpress_fixture(Path(tmp))
